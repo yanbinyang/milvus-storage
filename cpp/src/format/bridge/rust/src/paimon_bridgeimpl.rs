@@ -30,12 +30,15 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::sync::RwLock;
 
 use crate::TOKIO_RT;
+use crate::paimon_credential_provider::{
+    ERROR_INVALID_PREFIX, prepare_cloud_storage_options,
+};
 use crate::paimon_ffi::PaimonFileInfo;
 
 const METADATA_VERSION: u32 = 1;
-const ERROR_INVALID_PREFIX: &str = "[paimon:error=invalid]";
 const ERROR_NOT_IMPLEMENTED_PREFIX: &str = "[paimon:error=not-implemented]";
 const ERROR_NOT_FOUND_PREFIX: &str = "[paimon:error=not-found]";
 const ERROR_TRANSIENT_THROTTLING_PREFIX: &str = "[paimon:error=transient-throttling]";
@@ -47,7 +50,6 @@ const DELETION_VECTOR_MAGIC: u32 = 1_581_511_376;
 /// size in `DeletionFile.length`, unlike the bitmap32 envelope.
 const DELETION_VECTOR_BITMAP64_MAGIC: u32 = 1_681_511_377;
 const MAX_DATA_SPLIT_METADATA_BYTES: usize = 12 * 1024 * 1024;
-
 // CXX carries Rust errors as strings. These stable markers are consumed only
 // by the C++ bridge, which converts them into Arrow statuses before returning
 // to format callers. Keep their spelling in sync with paimon_bridge.cpp and
@@ -713,9 +715,10 @@ pub fn paimon_plan_files(
     storage_options_values: Vec<String>,
 ) -> Result<Vec<PaimonFileInfo>> {
     let mode = ScanMode::parse(scan_mode).map_err(classify_bridge_error)?;
-    let options = options_from_vecs(storage_options_keys, storage_options_values)
+    let base_options = options_from_vecs(storage_options_keys, storage_options_values)
         .map_err(classify_bridge_error)?;
     TOKIO_RT.block_on(async move {
+        let options = prepare_cloud_storage_options(table_location, base_options).await?;
         let snapshot_id = (snapshot_id >= 0).then_some(snapshot_id);
         let table = load_table(table_location, &options, snapshot_id).await?;
         let table_read_semantics = TableReadSemantics::from_table(&table)?;
@@ -992,15 +995,13 @@ pub fn paimon_read_deletion_vector(
     storage_options_keys: Vec<String>,
     storage_options_values: Vec<String>,
 ) -> Result<Vec<u64>> {
-    let options = options_from_vecs(storage_options_keys, storage_options_values)
+    let base_options = options_from_vecs(storage_options_keys, storage_options_values)
         .map_err(classify_bridge_error)?;
-    TOKIO_RT.block_on(read_deletion_vector_at(
-        path,
-        offset,
-        length,
-        expected_cardinality,
-        &options,
-    ))
+    TOKIO_RT
+        .block_on(async move {
+            let options = prepare_cloud_storage_options(path, base_options).await?;
+            read_deletion_vector_at(path, offset, length, expected_cardinality, &options).await
+        })
     .map_err(classify_bridge_error)
 }
 
@@ -1047,8 +1048,16 @@ impl RecordBatchReader for PaimonStreamReader {
 /// caller-supplied projection, so one cached handle serves every reader
 /// instance created from the same metadata (see
 /// `PaimonFormatReader::MetaTrait`).
-pub struct BlockingPaimonDataSplitReader {
+struct PaimonTableState {
+    storage_options: HashMap<String, String>,
     table: Table,
+}
+
+pub struct BlockingPaimonDataSplitReader {
+    table_location: String,
+    snapshot_id: Option<i64>,
+    base_storage_options: HashMap<String, String>,
+    table_state: RwLock<PaimonTableState>,
     split: DataSplit,
     schema: SchemaRef,
 }
@@ -1059,7 +1068,7 @@ fn open_data_split_reader_impl(
     storage_options_keys: Vec<String>,
     storage_options_values: Vec<String>,
 ) -> Result<Box<BlockingPaimonDataSplitReader>> {
-    let options = options_from_vecs(storage_options_keys, storage_options_values)?;
+    let base_storage_options = options_from_vecs(storage_options_keys, storage_options_values)?;
     let (metadata, split) = decode_split_metadata(metadata_json).map_err(|error| {
         anyhow!("{ERROR_INVALID_PREFIX} invalid Paimon data-split descriptor: {error:#}")
     })?;
@@ -1069,12 +1078,27 @@ fn open_data_split_reader_impl(
     let table_location = metadata
         .table_location
         .as_deref()
-        .ok_or_else(|| anyhow!("Paimon data-split descriptor has no table_location"))?;
-    let table = TOKIO_RT.block_on(load_table(table_location, &options, metadata.snapshot_id))?;
+        .ok_or_else(|| anyhow!("Paimon data-split descriptor has no table_location"))?
+        .to_string();
+    let storage_options = TOKIO_RT.block_on(prepare_cloud_storage_options(
+        &table_location,
+        base_storage_options.clone(),
+    ))?;
+    let table = TOKIO_RT.block_on(load_table(
+        &table_location,
+        &storage_options,
+        metadata.snapshot_id,
+    ))?;
     let read = table.new_read_builder().new_read()?;
     let schema = paimon::arrow::build_target_arrow_schema(read.read_type())?;
     Ok(Box::new(BlockingPaimonDataSplitReader {
-        table,
+        table_location,
+        snapshot_id: metadata.snapshot_id,
+        base_storage_options,
+        table_state: RwLock::new(PaimonTableState {
+            storage_options,
+            table,
+        }),
         split,
         schema,
     }))
@@ -1096,6 +1120,39 @@ pub fn paimon_open_data_split_reader(
 }
 
 impl BlockingPaimonDataSplitReader {
+    fn current_table(&self) -> Result<Table> {
+        let storage_options = TOKIO_RT.block_on(prepare_cloud_storage_options(
+            &self.table_location,
+            self.base_storage_options.clone(),
+        ))?;
+        {
+            let state = self
+                .table_state
+                .read()
+                .map_err(|_| anyhow!("Paimon table credential state lock is poisoned"))?;
+            if state.storage_options == storage_options {
+                return Ok(state.table.clone());
+            }
+        }
+
+        let mut state = self
+            .table_state
+            .write()
+            .map_err(|_| anyhow!("Paimon table credential state lock is poisoned"))?;
+        if state.storage_options != storage_options {
+            let table = TOKIO_RT.block_on(load_table(
+                &self.table_location,
+                &storage_options,
+                self.snapshot_id,
+            ))?;
+            *state = PaimonTableState {
+                storage_options,
+                table,
+            };
+        }
+        Ok(state.table.clone())
+    }
+
     /// Export the full (unprojected) read schema of the split.
     pub unsafe fn export_schema(&self, out_schema_ptr: *mut u8) -> Result<()> {
         let ffi_schema = FFI_ArrowSchema::try_from(self.schema.as_ref())
@@ -1121,9 +1178,14 @@ impl BlockingPaimonDataSplitReader {
         projected_columns: Vec<String>,
         out_stream_ptr: *mut u8,
     ) -> Result<()> {
+        // Refreshable cloud providers return a concrete credential snapshot to
+        // paimon-rust. Rebuild the pinned table only when that snapshot changes.
+        // FIXME(yanbinyang): Reopen a stream after mid-stream credential expiry
+        // once paimon-rust exposes a restartable scan context.
+        let table = self.current_table()?;
         // FIXME(yanbinyang): Reuse file metadata across projected streams once
         // paimon-rust exposes a scan-scoped read context, avoiding repeated footer reads.
-        let mut builder = self.table.new_read_builder();
+        let mut builder = table.new_read_builder();
         if !projected_columns.is_empty() {
             let projected_refs = projected_columns
                 .iter()

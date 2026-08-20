@@ -71,15 +71,37 @@ TEST(PaimonStorageOptionsTest, AwsStaticCredentialsAndAddressing) {
   EXPECT_EQ(virtual_host_options.at("s3.path-style-access"), "false");
 }
 
-TEST(PaimonStorageOptionsTest, DelegatedCredentialsFailClosed) {
+TEST(PaimonStorageOptionsTest, AwsDelegatedCredentialsUseSharedProvider) {
   auto config = MakeAwsConfig();
   config.role_arn = "arn:aws:iam::123456789012:role/paimon-reader";
-  EXPECT_TRUE(ToStorageOptions(config).status().IsNotImplemented());
+  config.session_name = "paimon-session";
+  config.external_id = "external-id";
+  config.load_frequency = 1800;
 
-  config.role_arn.clear();
+  ASSERT_AND_ASSIGN(auto options, ToStorageOptions(config));
+  EXPECT_EQ(options.at("cloud_provider"), kCloudProviderAWS);
+  EXPECT_EQ(options.at("client.assume-role.arn"), config.role_arn);
+  EXPECT_EQ(options.at("client.assume-role.session-name"), config.session_name);
+  EXPECT_EQ(options.at("client.assume-role.external-id"), config.external_id);
+  EXPECT_EQ(options.at("aws_credential_refresh_secs"), "1800");
+  EXPECT_EQ(options.at("milvus_fs_cache_key"), config.GetCacheKey());
+  EXPECT_EQ(options.count("s3.access-key"), 0);
+  EXPECT_EQ(options.count("s3.secret-key"), 0);
+}
+
+TEST(PaimonStorageOptionsTest, GcpDelegatedCredentialsUseSharedProvider) {
+  ArrowFileSystemConfig config;
+  config.storage_type = "remote";
   config.cloud_provider = kCloudProviderGCP;
+  config.use_iam = true;
   config.gcp_target_service_account = "target@project.iam.gserviceaccount.com";
-  EXPECT_TRUE(ToStorageOptions(config).status().IsNotImplemented());
+  config.load_frequency = 1800;
+
+  ASSERT_AND_ASSIGN(auto options, ToStorageOptions(config));
+  EXPECT_EQ(options.at("gcs.service-account"), config.gcp_target_service_account);
+  EXPECT_EQ(options.at("gcp_credential_refresh_secs"), "1800");
+  EXPECT_EQ(options.at("milvus_fs_cache_key"), config.GetCacheKey());
+  EXPECT_EQ(options.count("gcs.credential"), 0);
 }
 
 TEST(PaimonStorageOptionsTest, AwsIamUsesDefaultCredentialChain) {
@@ -124,6 +146,28 @@ TEST(PaimonStorageOptionsTest, AliyunStaticCredentials) {
   EXPECT_EQ(options.at("fs.oss.accessKeySecret"), config.access_key_value);
 }
 
+TEST(PaimonStorageOptionsTest, AliyunDelegatedCredentialsUseSharedProvider) {
+  ArrowFileSystemConfig config;
+  config.storage_type = "remote";
+  config.cloud_provider = kCloudProviderAliyun;
+  config.address = "oss-cn-hangzhou.aliyuncs.com";
+  config.use_ssl = true;
+  config.role_arn = "acs:ram::123456789012:role/paimon-reader";
+  config.session_name = "paimon-session";
+  config.external_id = "external-id";
+  config.load_frequency = 1800;
+
+  ASSERT_AND_ASSIGN(auto options, ToStorageOptions(config));
+  EXPECT_EQ(options.at("oss.endpoint"), "https://oss-cn-hangzhou.aliyuncs.com");
+  EXPECT_EQ(options.at("oss.role-arn"), config.role_arn);
+  EXPECT_EQ(options.at("oss.role-session-name"), config.session_name);
+  EXPECT_EQ(options.at("oss.external-id"), config.external_id);
+  EXPECT_EQ(options.at("oss_credential_refresh_secs"), "1800");
+  EXPECT_EQ(options.at("milvus_fs_cache_key"), config.GetCacheKey());
+  EXPECT_EQ(options.count("fs.oss.accessKeyId"), 0);
+  EXPECT_EQ(options.count("fs.oss.accessKeySecret"), 0);
+}
+
 TEST(PaimonStorageOptionsTest, AzureAccountKey) {
   ArrowFileSystemConfig config;
   config.storage_type = "remote";
@@ -137,6 +181,34 @@ TEST(PaimonStorageOptionsTest, AzureAccountKey) {
   EXPECT_EQ(options.at("azure.endpoint"), "https://account.dfs.core.windows.net");
   EXPECT_EQ(options.at("azure.account-name"), "account");
   EXPECT_EQ(options.at("azure.account-key"), "account-key");
+}
+
+TEST(PaimonStorageOptionsTest, AzureBrokerUsesSharedProvider) {
+  ArrowFileSystemConfig config;
+  config.storage_type = "remote";
+  config.cloud_provider = kCloudProviderAzure;
+  config.address = "core.windows.net";
+  config.use_ssl = true;
+  config.access_key_id = "account";
+  config.bucket_name = "container";
+  config.region = "westus3";
+  config.azure_client_id = "client-id";
+  config.azure_tenant_id = "tenant-id";
+  config.azure_credential_endpoint = "https://broker.example.com/credentials";
+  config.load_frequency = 1800;
+  config.request_timeout_ms = 5000;
+
+  ASSERT_AND_ASSIGN(auto options, ToStorageOptions(config));
+  EXPECT_EQ(options.at("azure.endpoint"), "https://account.dfs.core.windows.net");
+  EXPECT_EQ(options.at("azure_broker_endpoint"), config.azure_credential_endpoint);
+  EXPECT_EQ(options.at("azure_broker_client_id"), config.azure_client_id);
+  EXPECT_EQ(options.at("azure_broker_tenant_id"), config.azure_tenant_id);
+  EXPECT_EQ(options.at("azure_broker_account_name"), config.access_key_id);
+  EXPECT_EQ(options.at("azure_broker_bucket"), config.bucket_name);
+  EXPECT_EQ(options.at("azure_broker_duration_seconds"), "1800");
+  EXPECT_EQ(options.at("azure_broker_request_timeout_ms"), "5000");
+  EXPECT_EQ(options.at("milvus_fs_cache_key"), config.GetCacheKey());
+  EXPECT_EQ(options.count("azure.account-key"), 0);
 }
 
 TEST(PaimonStorageOptionsTest, AzureWorkloadIdentityRequiresCompleteServicePrincipal) {

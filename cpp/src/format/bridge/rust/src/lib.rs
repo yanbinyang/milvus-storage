@@ -22,6 +22,7 @@ mod iceberg_testutil;
 mod lance_bridgeimpl;
 mod lance_memory_estimator;
 mod paimon_bridgeimpl;
+mod paimon_credential_provider;
 mod paimon_split_serde;
 mod paimon_testutil;
 mod predicate_parser;

@@ -28,39 +28,75 @@ arrow::Result<std::unordered_map<std::string, std::string>> ToStorageOptions(con
   auto endpoint = [&config]() {
     return config.address.empty() ? std::string{} : StorageUri::BuildEndpointUrl(config.address, config.use_ssl);
   };
+  auto set_credential_cache_key = [&]() { options["milvus_fs_cache_key"] = config.GetCacheKey(); };
 
   if (config.storage_type == "local") {
     return options;
   }
-  // Delegated credentials are intentionally outside the initial direct-file
-  // integration. Reject them instead of silently falling back to another
-  // credential source.
-  if (!config.role_arn.empty()) {
-    return arrow::Status::NotImplemented("Paimon role ARN credentials are not supported");
-  }
-  if (!config.gcp_target_service_account.empty()) {
-    return arrow::Status::NotImplemented("Paimon GCS service account impersonation is not supported");
-  }
+  options["cloud_provider"] = config.cloud_provider;
   if (config.cloud_provider == kCloudProviderAWS) {
     set("s3.endpoint", endpoint());
     set("s3.region", config.region);
     options["s3.path-style-access"] = config.use_virtual_host ? "false" : "true";
-    if (!config.use_iam) {
+    if (!config.role_arn.empty()) {
+      set_credential_cache_key();
+      set("client.assume-role.arn", config.role_arn);
+      set("client.assume-role.session-name", config.session_name);
+      set("client.assume-role.external-id", config.external_id);
+      if (config.load_frequency > 0) {
+        options["aws_credential_refresh_secs"] = std::to_string(config.load_frequency);
+      }
+    } else if (!config.use_iam) {
       set("s3.access-key", config.access_key_id);
       set("s3.secret-key", config.access_key_value);
     }
     return options;
   }
   if (config.cloud_provider == kCloudProviderAliyun) {
-    set("fs.oss.endpoint", endpoint());
-    set("fs.oss.accessKeyId", config.access_key_id);
-    set("fs.oss.accessKeySecret", config.access_key_value);
+    if (!config.role_arn.empty()) {
+      set_credential_cache_key();
+      set("oss.endpoint", endpoint());
+      set("oss.region", config.region);
+      set("oss.role-arn", config.role_arn);
+      set("oss.role-session-name", config.session_name);
+      set("oss.external-id", config.external_id);
+      if (config.load_frequency > 0) {
+        options["oss_credential_refresh_secs"] = std::to_string(config.load_frequency);
+      }
+    } else {
+      set("fs.oss.endpoint", endpoint());
+      set("fs.oss.accessKeyId", config.access_key_id);
+      set("fs.oss.accessKeySecret", config.access_key_value);
+    }
     return options;
   }
   if (config.cloud_provider == kCloudProviderAzure) {
-    set("azure.endpoint", endpoint());
+    if (!config.address.empty()) {
+      auto address = config.address;
+      if (address.find("://") != std::string::npos || address.starts_with(config.access_key_id + ".")) {
+        options["azure.endpoint"] = StorageUri::BuildEndpointUrl(address, config.use_ssl);
+      } else {
+        const auto* azurite = std::getenv("USE_AZURITE");
+        const bool path_style = azurite && std::string(azurite) == "true";
+        if (!path_style && !address.starts_with(".")) {
+          address = ".dfs." + address;
+        }
+        options["azure.endpoint"] =
+            StorageUri::BuildAzureEndpointAddress(address, config.access_key_id, config.use_ssl);
+      }
+    }
     set("azure.account-name", config.access_key_id);
-    if (config.use_iam) {
+    if (config.IsAzureCredentialBrokerEnabled()) {
+      set_credential_cache_key();
+      set("azure_broker_endpoint", config.azure_credential_endpoint);
+      set("azure_broker_client_id", config.azure_client_id);
+      set("azure_broker_tenant_id", config.azure_tenant_id);
+      set("azure_broker_account_name", config.access_key_id);
+      set("azure_broker_region", config.region);
+      set("azure_broker_bucket", config.bucket_name);
+      options["azure_broker_duration_seconds"] = std::to_string(config.load_frequency);
+      options["azure_broker_request_timeout_ms"] = std::to_string(config.request_timeout_ms);
+    } else if (config.use_iam) {
       auto nonempty_env = [](const char* name) -> const char* {
         const auto* value = std::getenv(name);
         return value && *value != '\0' ? value : nullptr;
@@ -86,9 +122,17 @@ arrow::Result<std::unordered_map<std::string, std::string>> ToStorageOptions(con
   }
   if (config.cloud_provider == kCloudProviderGCP) {
     set("gcs.endpoint", endpoint());
-    set("gcs.credential", arrow::util::base64_encode(config.gcp_credential_json));
-    if (config.gcp_native_without_auth) {
-      options["gcs.allow-anonymous"] = "true";
+    if (config.use_iam && !config.gcp_target_service_account.empty()) {
+      set_credential_cache_key();
+      set("gcs.service-account", config.gcp_target_service_account);
+      if (config.load_frequency > 0) {
+        options["gcp_credential_refresh_secs"] = std::to_string(config.load_frequency);
+      }
+    } else {
+      set("gcs.credential", arrow::util::base64_encode(config.gcp_credential_json));
+      if (config.gcp_native_without_auth) {
+        options["gcs.allow-anonymous"] = "true";
+      }
     }
     return options;
   }

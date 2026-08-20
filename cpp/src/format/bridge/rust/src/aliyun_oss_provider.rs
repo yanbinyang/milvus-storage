@@ -485,7 +485,7 @@ fn parse_aliyun_expiration_to_ms(s: &str) -> Result<u64, String> {
     u64::try_from(dt.timestamp_millis()).map_err(|_| format!("pre-epoch Expiration: {s}"))
 }
 
-fn parse_oss_credential_duration(
+pub(crate) fn parse_oss_credential_duration(
     storage_options: &HashMap<String, String>,
 ) -> Result<Duration, String> {
     let Some(raw) = storage_options.get(OSS_CREDENTIAL_REFRESH_SECS_KEY) else {
@@ -596,7 +596,7 @@ impl RefreshableAliyunOssStore {
         Ok(Some(store))
     }
 
-    async fn current_config(&self) -> ObjectStoreResult<HashMap<String, String>> {
+    pub(crate) async fn current_config(&self) -> ObjectStoreResult<HashMap<String, String>> {
         self.current_store().await?;
         let cached = self.cache.read().await;
         Ok(cached

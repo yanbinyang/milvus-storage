@@ -132,7 +132,9 @@ impl AssumeRoleConfig {
         }))
     }
 
-    async fn build_credentials(&self) -> LanceResult<object_store::aws::AwsCredentialProvider> {
+    pub(crate) async fn build_credentials(
+        &self,
+    ) -> LanceResult<object_store::aws::AwsCredentialProvider> {
         const REFRESH_OFFSET_SECS: u64 = 300;
 
         let mut builder = AssumeRoleProvider::builder(&self.role_arn)
