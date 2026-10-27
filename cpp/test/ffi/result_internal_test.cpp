@@ -159,6 +159,15 @@ TEST(FFIInternalResultTest, MapsPlainPathNotFoundToFileNotFound) {
   EXPECT_EQ(FFIErrorCodeFromExtendStatus(status, LOON_ARROW_ERROR), LOON_FILE_NOT_FOUND);
 }
 
+TEST(FFIInternalResultTest, PreservesPermissionDeniedAndNotSupported) {
+  for (const auto error_number : {EACCES, EPERM}) {
+    auto status = arrow::Status::IOError("denied").WithDetail(arrow::internal::StatusDetailFromErrno(error_number));
+    EXPECT_EQ(FFIErrorCodeFromExtendStatus(status, LOON_ARROW_ERROR), LOON_PERMISSION_DENIED);
+  }
+  EXPECT_EQ(FFIErrorCodeFromExtendStatus(arrow::Status::NotImplemented("unsupported"), LOON_ARROW_ERROR),
+            LOON_NOT_SUPPORT);
+}
+
 TEST(FFIInternalResultTest, AsyncReadCallbackPreservesExtendStatusCode) {
   auto status = MakeExtendError(ExtendStatusCode::StorageTransientNetwork, "network", "network detail");
   auto file = std::make_shared<FailingAsyncRandomAccessFile>(status);

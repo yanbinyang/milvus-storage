@@ -15,10 +15,15 @@
 #pragma once
 
 #include <string>
+#include <string_view>
+#include <arrow/status.h>
 #include <unordered_map>
 #include "rust/cxx.h"
 
 namespace milvus_storage {
+
+inline constexpr std::string_view kFFIErrorCodeMarker = "__LOON_FFI_ERRCODE__=";
+arrow::Status MakeBridgeErrorStatus(std::string_view message);
 
 inline void ConvertStorageOptions(const std::unordered_map<std::string, std::string>& storage_options,
                                   rust::Vec<rust::String>& keys,

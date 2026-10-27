@@ -197,6 +197,15 @@ static void test_filesystem_get_file_info(void) {
   ck_assert_msg(loon_ffi_is_success(&rc), "%s", loon_ffi_get_errmsg(&rc));
   ck_assert_int_gt(out_size, 0);
 
+  uint64_t object_size = 0;
+  int64_t mtime_ns = 0;
+  bool is_dir = true;
+  rc = loon_filesystem_get_object_info(fs_handle, TEST_FILE_NAME, strlen(TEST_FILE_NAME), &object_size, &mtime_ns,
+                                       &is_dir);
+  ck_assert_msg(loon_ffi_is_success(&rc), "%s", loon_ffi_get_errmsg(&rc));
+  ck_assert_int_eq(object_size, out_size);
+  ck_assert(!is_dir);
+
   loon_filesystem_destroy(fs_handle);
 }
 
@@ -510,6 +519,11 @@ static void test_filesystem_file_not_found(void) {
   out_size = 0;
   rc = loon_filesystem_get_file_info(fs_handle, missing, missing_len, &out_size);
   check_file_not_found(&rc, "get_file_info");
+
+  int64_t mtime_ns = 0;
+  bool is_dir = false;
+  rc = loon_filesystem_get_object_info(fs_handle, missing, missing_len, &out_size, &mtime_ns, &is_dir);
+  check_file_not_found(&rc, "get_object_info");
 
   // --- loon_filesystem_read_file ---
   uint8_t read_buf[16];

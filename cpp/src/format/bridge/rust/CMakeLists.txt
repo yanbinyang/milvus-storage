@@ -25,6 +25,7 @@ corrosion_add_cxxbridge(rust-bridge
     FILES lib.rs)
 
 target_include_directories(rust-bridge PUBLIC ${Arrow_INCLUDE_DIRS}
+    ${PROJECT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_BINARY_DIR}/corrosion_generated/cxxbridge/rust-bridge/include
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )

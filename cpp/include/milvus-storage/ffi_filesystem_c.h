@@ -329,6 +329,14 @@ FFI_EXPORT LoonFFIResult loon_filesystem_write_file(FileSystemHandle handle,
  */
 FFI_EXPORT LoonFFIResult loon_filesystem_delete_file(FileSystemHandle handle, const char* path_ptr, uint32_t path_len);
 
+/** Get size, type and modification time with one filesystem metadata call. */
+FFI_EXPORT LoonFFIResult loon_filesystem_get_object_info(FileSystemHandle handle,
+                                                         const char* path_ptr,
+                                                         uint32_t path_len,
+                                                         uint64_t* out_size,
+                                                         int64_t* out_mtime_ns,
+                                                         bool* out_is_dir);
+
 /**
  * Get path information (existence, type, timestamps).
  *

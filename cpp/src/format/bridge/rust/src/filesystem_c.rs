@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_compat::Compat;
+use futures::FutureExt;
 #[cfg(feature = "s3-crt-async")]
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
-use futures::FutureExt;
 
 use vortex::array::buffer::BufferHandle;
 #[cfg(feature = "s3-crt-async")]
@@ -217,12 +217,36 @@ pub struct LoonFileSystemMeta {
     pub value: *mut std::ffi::c_char,
 }
 
+#[repr(C)]
+pub struct LoonFileInfo {
+    pub path: *mut std::ffi::c_char,
+    pub path_len: u32,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime_ns: i64,
+}
+
+#[repr(C)]
+pub struct LoonFileInfoList {
+    pub entries: *mut LoonFileInfo,
+    pub count: u32,
+}
+
 #[cfg(feature = "s3-crt-async")]
-type LoonFileSystemReadAsyncCallback =
+pub(crate) type LoonFileSystemReadAsyncCallback =
     unsafe extern "C" fn(*mut std::ffi::c_void, LoonFFIResult, u64);
 
 unsafe extern "C" {
     unsafe fn loon_ffi_free_result(result: *mut LoonFFIResult);
+
+    pub static loon_errcode_arrow: i32;
+    pub static loon_errcode_file_not_found: i32;
+    pub static loon_errcode_permission_denied: i32;
+    pub static loon_errcode_aws_not_found: i32;
+    pub static loon_errcode_aws_access_denied: i32;
+    pub static loon_errcode_aws_precondition_failed: i32;
+    pub static loon_errcode_transient_throttling: i32;
+    pub static loon_errcode_not_support: i32;
 
     // C-ABI: write data from pointer + size, return number of bytes written or negative error code
     unsafe fn loon_filesystem_open_writer(
@@ -252,8 +276,27 @@ unsafe extern "C" {
         out_size: *mut u64,
     ) -> LoonFFIResult;
 
+    pub unsafe fn loon_filesystem_get_object_info(
+        ptr: *mut c_void,
+        path_ptr: *const u8,
+        path_len: u32,
+        out_size: *mut u64,
+        out_mtime_ns: *mut i64,
+        out_is_dir: *mut bool,
+    ) -> LoonFFIResult;
+
+    pub unsafe fn loon_filesystem_list_dir(
+        ptr: *mut c_void,
+        path_ptr: *const u8,
+        path_len: u32,
+        recursive: bool,
+        out_list: *mut LoonFileInfoList,
+    ) -> LoonFFIResult;
+
+    pub unsafe fn loon_filesystem_free_file_info_list(list: *mut LoonFileInfoList);
+
     // C-ABI: open a RandomAccessFile reader handle (one OpenInputFile, reuse for multiple ReadAt)
-    unsafe fn loon_filesystem_open_reader(
+    pub(crate) unsafe fn loon_filesystem_open_reader(
         fs: *mut std::ffi::c_void,
         path_ptr: *const u8,
         path_len: u32,
@@ -261,15 +304,17 @@ unsafe extern "C" {
         out_reader_ptr: *mut *mut std::ffi::c_void,
     ) -> LoonFFIResult;
 
-    unsafe fn loon_filesystem_reader_readat(
+    pub(crate) unsafe fn loon_filesystem_reader_readat(
         reader: *mut std::ffi::c_void,
         offset: u64,
         nbytes: u64,
         out_data: *mut u8,
     ) -> LoonFFIResult;
 
-    unsafe fn loon_filesystem_reader_close(reader: *mut std::ffi::c_void) -> LoonFFIResult;
-    unsafe fn loon_filesystem_reader_destroy(reader: *mut std::ffi::c_void);
+    pub(crate) unsafe fn loon_filesystem_reader_close(
+        reader: *mut std::ffi::c_void,
+    ) -> LoonFFIResult;
+    pub(crate) unsafe fn loon_filesystem_reader_destroy(reader: *mut std::ffi::c_void);
 }
 
 #[cfg(feature = "s3-crt-async")]
@@ -279,7 +324,7 @@ unsafe extern "C" {
         out_supported: *mut bool,
     ) -> LoonFFIResult;
 
-    unsafe fn loon_filesystem_reader_readat_async(
+    pub(crate) unsafe fn loon_filesystem_reader_readat_async(
         reader: *mut std::ffi::c_void,
         offset: u64,
         nbytes: u64,
@@ -287,6 +332,67 @@ unsafe extern "C" {
         callback: LoonFileSystemReadAsyncCallback,
         user_data: *mut std::ffi::c_void,
     ) -> LoonFFIResult;
+}
+
+pub(crate) const LOON_FFI_ERRCODE_MARKER: &str = "__LOON_FFI_ERRCODE__=";
+
+#[derive(Debug)]
+pub struct LoonFFIError {
+    pub err_code: i32,
+    context: String,
+    message: String,
+}
+
+impl std::fmt::Display for LoonFFIError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{LOON_FFI_ERRCODE_MARKER}{}; {}: {}",
+            self.err_code, self.context, self.message
+        )
+    }
+}
+
+impl std::error::Error for LoonFFIError {}
+
+pub fn check_loon_ffi_result_typed(
+    result: &mut LoonFFIResult,
+    context: &str,
+) -> Result<(), LoonFFIError> {
+    if result.err_code != 0 {
+        let err_code = result.err_code;
+        // Safely copy C string into owned Rust String, handle null and invalid UTF-8.
+        let message = unsafe {
+            if result.message.is_null() {
+                "Unknown error".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(result.message)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        unsafe { loon_ffi_free_result(result as *mut LoonFFIResult) };
+        return Err(LoonFFIError {
+            err_code,
+            context: context.to_string(),
+            message,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "s3-crt-async")]
+pub fn reader_supports_async_typed(reader: *mut c_void) -> Result<bool, LoonFFIError> {
+    let mut supported = false;
+    let mut result =
+        unsafe { loon_filesystem_reader_supports_async(reader, &mut supported as *mut bool) };
+    check_loon_ffi_result_typed(&mut result, "Failed to check reader async support")?;
+    Ok(supported)
+}
+
+#[cfg(not(feature = "s3-crt-async"))]
+pub fn reader_supports_async_typed(_reader: *mut c_void) -> Result<bool, LoonFFIError> {
+    Ok(false)
 }
 
 const LOON_VORTEX_FFI_ERRCODE_MARKER: &str = "__LOON_VORTEX_FFI_ERRCODE__=";
@@ -320,22 +426,8 @@ fn ffi_err(err_code: i32, context: &str, message: String) -> VortexError {
 
 // Helper to check LoonFFIResult and convert to VortexError if needed.
 fn check_loon_ffi_result(result: &mut LoonFFIResult, context: &str) -> Result<(), VortexError> {
-    if result.err_code != 0 {
-        let err_code = result.err_code;
-        // Safely copy C string into owned Rust String, handle null and invalid UTF-8.
-        let message = unsafe {
-            if result.message.is_null() {
-                "Unknown error".to_string()
-            } else {
-                std::ffi::CStr::from_ptr(result.message)
-                    .to_string_lossy()
-                    .into_owned()
-            }
-        };
-        unsafe { loon_ffi_free_result(result as *mut LoonFFIResult) };
-        return Err(ffi_err(err_code, context, message));
-    }
-    Ok(())
+    check_loon_ffi_result_typed(result, context)
+        .map_err(|error| ffi_err(error.err_code, &error.context, error.message))
 }
 
 #[cfg(feature = "s3-crt-async")]
@@ -767,17 +859,17 @@ fn vortex_read_source_uri(path: &str) -> Arc<str> {
 
 /// Arc-wrapped reader handle that ensures the underlying C++ RandomAccessFile
 /// is only closed/destroyed after all concurrent read tasks are done.
-struct ReaderHandle {
-    ptr: *mut c_void,
+pub(crate) struct ReaderHandle {
+    pub(crate) ptr: *mut c_void,
     #[cfg_attr(not(feature = "s3-crt-async"), allow(dead_code))]
-    supports_async: bool,
+    pub(crate) supports_async: bool,
 }
 
 unsafe impl Send for ReaderHandle {}
 unsafe impl Sync for ReaderHandle {}
 
 impl ReaderHandle {
-    fn as_ptr(&self) -> *mut c_void {
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
         self.ptr
     }
 }
